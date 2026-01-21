@@ -56,7 +56,7 @@ class FrozenSAMMaskGenerator:
             .cpu()
             .numpy()
         )
-        boxes_np = boxes_xyxy.detach().cpu().numpy()
+        boxes_np = boxes_xyxy.detach().cpu().numpy().astype("float32")
 
         # SAM2 API integration point: set image + predict masks with bbox prompts.
         self.sam_predictor.set_image(image_np)

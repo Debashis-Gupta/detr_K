@@ -80,6 +80,10 @@ def get_args_parser():
                         help="Relative classification weight of the no-object class")
     parser.add_argument('--lambda_sal', default=0.1, type=float,
                         help="Weight for saliency loss (set to 0 to disable).")
+    parser.add_argument('--sam2_checkpoint', default=None, type=str,
+                        help="Path to a SAM2 checkpoint for saliency supervision.")
+    parser.add_argument('--sam2_model', default='sam2_hiera_t', type=str,
+                        help="SAM2 model key (see sam2 build_sam2 docs).")
 
     # dataset parameters
     parser.add_argument('--dataset_file', default='coco')
@@ -134,11 +138,21 @@ def main(args):
     sam_mask_generator = None
     grad_cam = None
     if args.lambda_sal > 0:
-        # TODO: Initialize a SAM2 predictor here and pass it into FrozenSAMMaskGenerator.
-        # Example (pseudo):
-        #   sam_predictor = SAM2Predictor.from_checkpoint(path).to(device)
-        #   sam_predictor.eval()
-        sam_predictor = None
+        if args.sam2_checkpoint is None:
+            raise RuntimeError("Set --sam2_checkpoint to enable saliency supervision.")
+        try:
+            from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+        except ImportError as exc:
+            raise RuntimeError(
+                "SAM2 is not installed. Install https://github.com/facebookresearch/sam2."
+            ) from exc
+
+        sam_model = build_sam2(args.sam2_model, args.sam2_checkpoint, device=device)
+        sam_model.eval()
+        for parameter in sam_model.parameters():
+            parameter.requires_grad_(False)
+        sam_predictor = SAM2ImagePredictor(sam_model)
         sam_mask_generator = FrozenSAMMaskGenerator(sam_predictor)
 
         # Hook the backbone's last conv feature map (e.g., ResNet layer4 output).
