@@ -14,6 +14,7 @@ import datasets
 import util.misc as utils
 from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
+from models.saliency import FrozenSAMMaskGenerator, GradCAMForDETR
 from models import build_model
 
 
@@ -77,6 +78,12 @@ def get_args_parser():
     parser.add_argument('--giou_loss_coef', default=2, type=float)
     parser.add_argument('--eos_coef', default=0.1, type=float,
                         help="Relative classification weight of the no-object class")
+    parser.add_argument('--lambda_sal', default=0.1, type=float,
+                        help="Weight for saliency loss (set to 0 to disable).")
+    parser.add_argument('--sam2_checkpoint', default=None, type=str,
+                        help="Path to a SAM2 checkpoint for saliency supervision.")
+    parser.add_argument('--sam2_model', default='sam2_hiera_t', type=str,
+                        help="SAM2 model key (see sam2 build_sam2 docs).")
 
     # dataset parameters
     parser.add_argument('--dataset_file', default='coco')
@@ -127,6 +134,30 @@ def main(args):
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
+
+    sam_mask_generator = None
+    grad_cam = None
+    if args.lambda_sal > 0:
+        if args.sam2_checkpoint is None:
+            raise RuntimeError("Set --sam2_checkpoint to enable saliency supervision.")
+        try:
+            from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+        except ImportError as exc:
+            raise RuntimeError(
+                "SAM2 is not installed. Install https://github.com/facebookresearch/sam2."
+            ) from exc
+
+        sam_model = build_sam2(args.sam2_model, args.sam2_checkpoint, device=device)
+        sam_model.eval()
+        for parameter in sam_model.parameters():
+            parameter.requires_grad_(False)
+        sam_predictor = SAM2ImagePredictor(sam_model)
+        sam_mask_generator = FrozenSAMMaskGenerator(sam_predictor)
+
+        # Hook the backbone's last conv feature map (e.g., ResNet layer4 output).
+        target_layer = model_without_ddp.backbone[0].body.layer4
+        grad_cam = GradCAMForDETR(target_layer)
 
     param_dicts = [
         {"params": [p for n, p in model_without_ddp.named_parameters() if "backbone" not in n and p.requires_grad]},
@@ -195,7 +226,8 @@ def main(args):
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm)
+            args.clip_max_norm, sam_mask_generator=sam_mask_generator,
+            grad_cam=grad_cam, lambda_sal=args.lambda_sal)
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']

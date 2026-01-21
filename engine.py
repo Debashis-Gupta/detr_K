@@ -5,18 +5,60 @@ Train and eval functions used in main.py
 import math
 import os
 import sys
-from typing import Iterable
+from typing import Iterable, Optional
 
 import torch
 
 import util.misc as utils
+from util import box_ops
 from datasets.coco_eval import CocoEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
+from models.saliency import FrozenSAMMaskGenerator, GradCAMForDETR
+
+
+def _compute_saliency_loss(outputs, samples, targets, indices, sam_mask_generator, grad_cam):
+    mean = torch.tensor([0.485, 0.456, 0.406], device=samples.tensors.device)[:, None, None]
+    std = torch.tensor([0.229, 0.224, 0.225], device=samples.tensors.device)[:, None, None]
+    eps = 1e-6
+    sal_losses = []
+
+    for i, target in enumerate(targets):
+        h, w = target["size"].tolist()
+        image = samples.tensors[i, :, :h, :w]
+        image = image * std + mean
+
+        boxes = target["boxes"]
+        if boxes.numel() > 0:
+            boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes)
+            scale = torch.tensor([w, h, w, h], device=boxes.device, dtype=boxes.dtype)
+            boxes_xyxy = boxes_xyxy * scale
+        else:
+            boxes_xyxy = boxes
+
+        sam_mask = sam_mask_generator(image, boxes_xyxy).float().detach()
+
+        src_idx, tgt_idx = indices[i]
+        if src_idx.numel() == 0:
+            score = outputs["pred_logits"][i].sum() * 0.0
+        else:
+            target_labels = target["labels"][tgt_idx]
+            score = outputs["pred_logits"][i, src_idx, target_labels].sum()
+
+        cam = grad_cam.compute_cam(score, spatial_size=(h, w))[i]
+        intersection = (cam * sam_mask).sum()
+        denom = cam.sum() + sam_mask.sum()
+        sal_loss = 1 - (2 * intersection + eps) / (denom + eps)
+        sal_losses.append(sal_loss)
+
+    return torch.stack(sal_losses).mean()
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0):
+                    device: torch.device, epoch: int, max_norm: float = 0,
+                    sam_mask_generator: Optional[FrozenSAMMaskGenerator] = None,
+                    grad_cam: Optional[GradCAMForDETR] = None,
+                    lambda_sal: float = 0.0):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -30,8 +72,26 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
         outputs = model(samples)
-        loss_dict = criterion(outputs, targets)
-        weight_dict = criterion.weight_dict
+        if lambda_sal > 0:
+            loss_dict, indices = criterion(outputs, targets, return_indices=True)
+        else:
+            loss_dict = criterion(outputs, targets)
+            indices = None
+        weight_dict = criterion.weight_dict.copy()
+
+        if lambda_sal > 0:
+            if sam_mask_generator is None or grad_cam is None:
+                raise RuntimeError("Saliency loss enabled but SAM2/Grad-CAM helpers are missing.")
+            sal_loss = _compute_saliency_loss(
+                outputs=outputs,
+                samples=samples,
+                targets=targets,
+                indices=indices,
+                sam_mask_generator=sam_mask_generator,
+                grad_cam=grad_cam,
+            )
+            loss_dict["loss_sal"] = sal_loss
+            weight_dict["loss_sal"] = lambda_sal
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
         # reduce losses over all GPUs for logging purposes
